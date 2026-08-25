@@ -1,7 +1,7 @@
 pub mod models;
 
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
-use sqlx::SqlitePool;
+use sqlx::{SqlitePool, Transaction};
 use std::str::FromStr;
 use std::time::Duration;
 
@@ -22,6 +22,11 @@ pub async fn init_db_pool(db_url: &str) -> Result<SqlitePool, sqlx::Error> {
 
     run_embedded_migrations(&pool).await?;
     seed_default_data(&pool).await?;
+    if let Err(e) = seed_catalog_from_disk(&pool).await {
+        // A failed catalog import must never keep the store from starting;
+        // the owner can still add titles manually or rescan drives.
+        eprintln!("Catalog seed skipped: {}", e);
+    }
 
     Ok(pool)
 }
@@ -108,6 +113,7 @@ async fn run_embedded_migrations(pool: &SqlitePool) -> Result<(), sqlx::Error> {
     // 1) Add new columns to existing tables BEFORE any index is created on them.
     //    Otherwise CREATE TABLE IF NOT EXISTS is a no-op on old databases and the
     //    column/index creation fails with "no such column".
+    rename_legacy_columns(pool).await?;
     ensure_columns(
         pool,
         "videos",
@@ -157,6 +163,27 @@ async fn run_embedded_migrations(pool: &SqlitePool) -> Result<(), sqlx::Error> {
     // 3) Tune SQLite for read-heavy local catalog serving.
     for pragma in ["PRAGMA cache_size = -20000", "PRAGMA mmap_size = 268435456"] {
         let _ = sqlx::query(pragma).execute(pool).await;
+    }
+
+    Ok(())
+}
+
+/// Migrates column names from the early builds so owners upgrading an
+/// existing store keep their saved catalog instead of hitting SQL errors.
+async fn rename_legacy_columns(pool: &SqlitePool) -> Result<(), sqlx::Error> {
+    let videos_cols: std::collections::HashSet<String> =
+        sqlx::query_as("SELECT name FROM pragma_table_info('videos')")
+            .fetch_all(pool)
+            .await?
+            .into_iter()
+            .map(|(name,): (String,)| name)
+            .collect();
+
+    // Pricing was renamed from cents to Kyat when the store went multi-currency.
+    if videos_cols.contains("price_cents") && !videos_cols.contains("price_ks") {
+        sqlx::query("ALTER TABLE videos RENAME COLUMN price_cents TO price_ks")
+            .execute(pool)
+            .await?;
     }
 
     Ok(())
@@ -228,5 +255,136 @@ async fn seed_default_data(pool: &SqlitePool) -> Result<(), sqlx::Error> {
             .await?;
     }
 
+    Ok(())
+}
+
+// ─── Disk Catalog Import ───────────────────────────────────────────
+//
+// The full movie/series catalog (titles, Myanmar reviews, posters, real file
+// paths) is generated offline by `scripts/build-catalog.mjs` and embedded
+// here. Importing is idempotent: rows are keyed by their video_path, so a
+// re-launch only inserts what is genuinely new.
+
+const CATALOG_SEED_JSON: &str = include_str!("catalog_seed.json");
+
+#[derive(Debug, serde::Deserialize)]
+struct SeedCatalog {
+    extra_categories: Vec<SeedCategory>,
+    videos: Vec<SeedVideo>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct SeedCategory {
+    id: String,
+    name: String,
+    slug: String,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct SeedVideo {
+    category_id: String,
+    content_type: String,
+    title: String,
+    #[serde(default)]
+    description: Option<String>,
+    duration_seconds: i64,
+    release_year: Option<i64>,
+    price_ks: i64,
+    episode_number: Option<i64>,
+    episode_count: Option<i64>,
+    season_number: Option<i64>,
+    series_title: Option<String>,
+    video_path: String,
+    hard_disk_label: Option<String>,
+    trailer_path: Option<String>,
+    thumbnail_path: Option<String>,
+    file_size_bytes: i64,
+    mime_type: String,
+}
+
+async fn seed_catalog_from_disk(pool: &SqlitePool) -> Result<(), sqlx::Error> {
+    let seed: SeedCatalog = serde_json::from_str(CATALOG_SEED_JSON)
+        .map_err(|e| sqlx::Error::Configuration(e.into()))?;
+
+    let mut tx = pool.begin().await?;
+
+    for cat in &seed.extra_categories {
+        sqlx::query("INSERT OR IGNORE INTO categories (id, name, slug) VALUES (?, ?, ?)")
+            .bind(&cat.id)
+            .bind(&cat.name)
+            .bind(&cat.slug)
+            .execute(&mut *tx)
+            .await?;
+    }
+
+    // One lookup instead of one per row keeps the import fast on big catalogs.
+    let existing: std::collections::HashSet<String> =
+        sqlx::query_as::<_, (String,)>("SELECT video_path FROM videos")
+            .fetch_all(&mut *tx)
+            .await?
+            .into_iter()
+            .map(|(path,)| path)
+            .collect();
+
+    let total = seed.videos.len();
+    let now = chrono::Utc::now();
+    let mut inserted = 0usize;
+
+    for (idx, video) in seed
+        .videos
+        .iter()
+        .filter(|video| !existing.contains(&video.video_path))
+        .enumerate()
+    {
+        insert_seed_video(&mut tx, video, &now, idx).await?;
+        inserted += 1;
+    }
+
+    tx.commit().await?;
+
+    if inserted > 0 {
+        println!("📦 Imported {} of {} catalog titles from disk scan.", inserted, total);
+    }
+    Ok(())
+}
+
+async fn insert_seed_video(
+    tx: &mut Transaction<'_, sqlx::Sqlite>,
+    video: &SeedVideo,
+    base_time: &chrono::DateTime<chrono::Utc>,
+    index: usize,
+) -> Result<(), sqlx::Error> {
+    // Stagger timestamps so "newest first" listings keep the generator's order.
+    let created_at = (*base_time - chrono::Duration::seconds(index as i64)).to_rfc3339();
+
+    sqlx::query(
+        r#"INSERT INTO videos
+           (id, category_id, content_type, title, description, duration_seconds, release_year,
+            price_ks, episode_number, episode_count, season_number, series_title, video_path,
+            hard_disk_label, trailer_path, thumbnail_path, file_size_bytes, mime_type,
+            is_available, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)"#,
+    )
+    .bind(uuid::Uuid::new_v4().to_string())
+    .bind(&video.category_id)
+    .bind(&video.content_type)
+    .bind(&video.title)
+    .bind(&video.description)
+    .bind(video.duration_seconds)
+    .bind(video.release_year)
+    .bind(video.price_ks)
+    .bind(video.episode_number)
+    .bind(video.episode_count)
+    .bind(video.season_number)
+    .bind(&video.series_title)
+    .bind(&video.video_path)
+    .bind(&video.hard_disk_label)
+    .bind(&video.trailer_path)
+    .bind(&video.thumbnail_path)
+    .bind(video.file_size_bytes)
+    .bind(&video.mime_type)
+    .bind(created_at)
+    .execute(&mut **tx)
+    .await?;
     Ok(())
 }
